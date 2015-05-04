@@ -18,22 +18,21 @@ namespace cerb {
     public:
         Buffer buffer;
         util::sref<CommandGroup> const group;
-        bool const need_send;
 
-        virtual ~Command() {}
+        virtual ~Command() = default;
 
         virtual Server* select_server(Proxy* proxy) = 0;
-        virtual void copy_response(Buffer rsp, bool error);
+        virtual void on_remote_responsed(Buffer rsp, bool error);
 
-        Command(Buffer b, util::sref<CommandGroup> g, bool s)
+        void responsed();
+
+        Command(Buffer b, util::sref<CommandGroup> g)
             : buffer(std::move(b))
             , group(g)
-            , need_send(s)
         {}
 
-        Command(util::sref<CommandGroup> g, bool s)
+        explicit Command(util::sref<CommandGroup> g)
             : group(g)
-            , need_send(s)
         {}
 
         Command(Command const&) = delete;
@@ -41,16 +40,37 @@ namespace cerb {
         static void allow_write_commands();
     };
 
+    class DataCommand
+        : public Command
+    {
+    public:
+        DataCommand(Buffer b, util::sref<CommandGroup> g)
+            : Command(std::move(b), g)
+        {}
+
+        explicit DataCommand(util::sref<CommandGroup> g)
+            : Command(g)
+        {}
+
+        Time sent_time;
+        Time resp_time;
+
+        Interval remote_cost() const
+        {
+            return resp_time - sent_time;
+        }
+    };
+
     class CommandGroup {
     public:
         util::sref<Client> const client;
 
-        CommandGroup(util::sref<Client> cli)
+        explicit CommandGroup(util::sref<Client> cli)
             : client(cli)
         {}
 
         CommandGroup(CommandGroup const&) = delete;
-        virtual ~CommandGroup() {}
+        virtual ~CommandGroup() = default;
 
         virtual bool long_connection() const
         {
@@ -63,6 +83,7 @@ namespace cerb {
         virtual void append_buffer_to(std::vector<util::sref<Buffer>>& b) = 0;
         virtual int total_buffer_size() const = 0;
         virtual void command_responsed() = 0;
+        virtual void collect_stats(Proxy*) const {}
     };
 
     void split_client_command(Buffer& buffer, util::sref<Client> cli);

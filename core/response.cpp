@@ -22,9 +22,9 @@ namespace {
             , error(e)
         {}
 
-        void rsp_to(util::sref<Command> cmd, util::sref<Proxy>)
+        void rsp_to(util::sref<DataCommand> cmd, util::sref<Proxy>)
         {
-            cmd->copy_response(std::move(this->rsp), error);
+            cmd->on_remote_responsed(std::move(this->rsp), error);
         }
 
         Buffer const& dump_buffer() const
@@ -38,7 +38,7 @@ namespace {
     {
         static Buffer const dump;
     public:
-        void rsp_to(util::sref<Command> cmd, util::sref<Proxy> p)
+        void rsp_to(util::sref<DataCommand> cmd, util::sref<Proxy> p)
         {
             p->retry_move_ask_command_later(cmd);
         }

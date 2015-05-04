@@ -36,8 +36,8 @@ void Client::on_events(int events)
         }
     } catch (BadRedisMessage& e) {
         LOG(ERROR) << "Receive bad message from client " << this->fd
-                   << " because: " << e.what()
-                   << " dump buffer (before close): "
+                   << " because: " << e.what();
+        LOG(DEBUG) << "Dump buffer (before close): "
                    << this->_buffer.to_string();
         return this->close();
     }
@@ -66,6 +66,9 @@ void Client::_write_response()
         g->append_buffer_to(buffer_arr);
     }
     Buffer::writev(this->fd, buffer_arr);
+    for (auto const& g: this->_ready_groups) {
+        g->collect_stats(this->_proxy);
+    }
     this->_ready_groups.clear();
     this->_peers.clear();
 
@@ -167,11 +170,6 @@ void Client::group_responsed()
 void Client::add_peer(Server* svr)
 {
     this->_peers.insert(svr);
-}
-
-void Client::stat_proccessed(Interval cmd_elapse)
-{
-    _proxy->stat_proccessed(cmd_elapse);
 }
 
 void Client::push_command(util::sptr<CommandGroup> g)

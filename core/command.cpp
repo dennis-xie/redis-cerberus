@@ -13,6 +13,7 @@
 #include "globals.hpp"
 #include "utils/logging.hpp"
 #include "utils/random.hpp"
+#include "utils/string.h"
 
 using namespace cerb;
 
@@ -21,7 +22,7 @@ namespace {
     std::string const RSP_OK_STR("+OK\r\n");
     Buffer RSP_OK(Buffer::from_string(RSP_OK_STR));
 
-    Server* select_server_for(Proxy* proxy, Command* cmd, slot key_slot)
+    Server* select_server_for(Proxy* proxy, DataCommand* cmd, slot key_slot)
     {
         Server* svr = proxy->get_server_by_slot(key_slot);
         if (svr == nullptr) {
@@ -34,12 +35,12 @@ namespace {
     }
 
     class OneSlotCommand
-        : public Command
+        : public DataCommand
     {
         slot const key_slot;
     public:
         OneSlotCommand(Buffer b, util::sref<CommandGroup> g, slot ks)
-            : Command(std::move(b), g, true)
+            : DataCommand(std::move(b), g)
             , key_slot(ks)
         {
             LOG(DEBUG) << "-Keyslot = " << this->key_slot;
@@ -52,7 +53,7 @@ namespace {
     };
 
     class MultiStepsCommand
-        : public Command
+        : public DataCommand
     {
     public:
         slot current_key_slot;
@@ -60,7 +61,7 @@ namespace {
 
         MultiStepsCommand(util::sref<CommandGroup> group, slot s,
                           std::function<void(Buffer, bool)> r)
-            : Command(group, true)
+            : DataCommand(group)
             , current_key_slot(s)
             , on_rsp(std::move(r))
         {}
@@ -70,7 +71,7 @@ namespace {
             return ::select_server_for(proxy, this, this->current_key_slot);
         }
 
-        void copy_response(Buffer rsp, bool error)
+        void on_remote_responsed(Buffer rsp, bool error)
         {
             on_rsp(std::move(rsp), error);
         }
@@ -84,7 +85,7 @@ namespace {
         {
         public:
             DirectCommand(Buffer b, util::sref<CommandGroup> g)
-                : Command(std::move(b), g, false)
+                : Command(std::move(b), g)
             {}
 
             Server* select_server(Proxy*)
@@ -131,13 +132,6 @@ namespace {
     class StatsCommandGroup
         : public CommandGroup
     {
-    public:
-        ~StatsCommandGroup()
-        {
-            if (this->complete) {
-                this->client->stat_proccessed(Clock::now() - this->creation);
-            }
-        }
     protected:
         explicit StatsCommandGroup(util::sref<Client> cli)
             : CommandGroup(cli)
@@ -152,13 +146,21 @@ namespace {
         {
             return true;
         }
+
+        void collect_stats(Proxy* p) const
+        {
+            p->stat_proccessed(Clock::now() - this->creation,
+                               this->avg_commands_remote_cost());
+        }
+
+        virtual Interval avg_commands_remote_cost() const = 0;
     };
 
     class SingleCommandGroup
         : public StatsCommandGroup
     {
     public:
-        util::sptr<Command> command;
+        util::sptr<DataCommand> command;
 
         explicit SingleCommandGroup(util::sref<Client> cli)
             : StatsCommandGroup(cli)
@@ -190,6 +192,11 @@ namespace {
         {
             command->select_server(proxy);
         }
+
+        Interval avg_commands_remote_cost() const
+        {
+            return command->remote_cost();
+        }
     };
 
     class MultipleCommandsGroup
@@ -197,7 +204,7 @@ namespace {
     {
     public:
         Buffer arr_payload;
-        std::vector<util::sptr<Command>> commands;
+        std::vector<util::sptr<DataCommand>> commands;
         int awaiting_count;
 
         explicit MultipleCommandsGroup(util::sref<Client> c)
@@ -205,11 +212,9 @@ namespace {
             , awaiting_count(0)
         {}
 
-        void append_command(util::sptr<Command> c)
+        void append_command(util::sptr<DataCommand> c)
         {
-            if (c->need_send) {
-                awaiting_count += 1;
-            }
+            awaiting_count += 1;
             commands.push_back(std::move(c));
         }
 
@@ -229,7 +234,7 @@ namespace {
         void append_buffer_to(std::vector<util::sref<Buffer>>& b)
         {
             b.push_back(util::mkref(arr_payload));
-            for (auto const& c: commands) {
+            for (auto const& c: this->commands) {
                 b.push_back(util::mkref(c->buffer));
             }
         }
@@ -237,11 +242,9 @@ namespace {
         int total_buffer_size() const
         {
             int i = arr_payload.size();
-            std::for_each(commands.begin(), commands.end(),
-                          [&](util::sptr<Command> const& command)
-                          {
-                              i += command->buffer.size();
-                          });
+            for (auto const& c: this->commands) {
+                i += c->buffer.size();
+            }
             return i;
         }
 
@@ -250,6 +253,19 @@ namespace {
             for (auto& c: this->commands) {
                 c->select_server(proxy);
             }
+        }
+
+        Interval avg_commands_remote_cost() const
+        {
+            if (this->commands.empty()) {
+                return Interval(0);
+            }
+            return std::accumulate(
+                this->commands.begin(), this->commands.end(), Interval(0),
+                [](Interval a, util::sptr<DataCommand> const& c)
+                {
+                    return a + c->remote_cost();
+                }) / this->commands.size();
         }
     };
 
@@ -323,7 +339,7 @@ namespace {
         virtual util::sptr<CommandGroup> spawn_commands(
             util::sref<Client> c, Buffer::iterator end) = 0;
 
-        SpecialCommandParser() {}
+        SpecialCommandParser() = default;
         SpecialCommandParser(SpecialCommandParser const&) = delete;
     };
 
@@ -568,25 +584,25 @@ namespace {
             {
                 if (error) {
                     this->buffer = std::move(rsp);
-                    return this->group->command_responsed();
+                    return this->responsed();
                 }
                 if (rsp.same_as_string("$-1\r\n")) {
                     this->buffer = Buffer::from_string(
                         "-ERR no such key\r\n");
-                    return this->group->command_responsed();
+                    return this->responsed();
                 }
                 this->buffer = Buffer::from_string("*3\r\n$3\r\nSET\r\n");
                 this->buffer.append_from(new_key.begin(), new_key.end());
                 this->buffer.append_from(rsp.begin(), rsp.end());
                 this->current_key_slot = new_key_slot;
                 this->on_rsp =
-                    [&](Buffer rsp, bool error)
+                    [this](Buffer rsp, bool error)
                     {
                         if (error) {
                             this->buffer = std::move(rsp);
-                            return this->group->command_responsed();
+                            return this->responsed();
                         }
-                        rsp_set();
+                        this->rsp_set();
                     };
                 this->group->client->reactivate(util::mkref(*this));
             }
@@ -597,10 +613,10 @@ namespace {
                 this->buffer.append_from(old_key.begin(), old_key.end());
                 this->current_key_slot = old_key_slot;
                 this->on_rsp =
-                    [&](Buffer, bool)
+                    [this](Buffer, bool)
                     {
                         this->buffer = Buffer::from_string("+OK\r\n");
-                        this->group->command_responsed();
+                        this->responsed();
                     };
                 this->group->client->reactivate(util::mkref(*this));
             }
@@ -995,6 +1011,14 @@ namespace {
 
         void on_arr(cerb::rint size, Buffer::iterator i)
         {
+            /*
+             * Redis server will reset a request of more than 1M args.
+             * See also
+             * https://github.com/antirez/redis/blob/3.0/src/networking.c#L1014
+             */
+            if (size > 1024 * 1024) {
+                throw BadRedisMessage("Request is too large");
+            }
             if (!_nested_array_element_count.empty()) {
                 throw BadRedisMessage("Invalid nested array as client command");
             }
@@ -1009,9 +1033,14 @@ namespace {
 
 }
 
-void Command::copy_response(Buffer rsp, bool)
+void Command::on_remote_responsed(Buffer rsp, bool)
 {
     this->buffer = std::move(rsp);
+    this->responsed();
+}
+
+void Command::responsed()
+{
     this->group->command_responsed();
 }
 
